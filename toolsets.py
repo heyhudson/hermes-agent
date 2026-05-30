@@ -286,6 +286,24 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "signal": {
+        "description": "Signal read-only tools (contacts, groups, identities, devices, avatars, stickers, user status, calls)",
+        "tools": ["signal"],
+        "includes": [],
+    },
+
+    "signal_write": {
+        "description": "Signal messaging side-effects (receipts, reactions, polls) — opt-in, requires SIGNAL_WRITE_TOOLS=true; can target any recipient",
+        "tools": ["signal_write"],
+        "includes": [],
+    },
+
+    "signal_admin": {
+        "description": "Signal account-state management (block/unblock, trust identities, edit groups/contacts, remote-delete, pin, message-request responses) — requires SIGNAL_ADMIN_TOOLS=true + per-action confirmation",
+        "tools": ["signal_admin"],
+        "includes": [],
+    },
+
     "yuanbao": {
         "description": "Yuanbao platform tools - group info, member queries, DM, stickers",
         "tools": [
@@ -442,7 +460,10 @@ TOOLSETS = {
     
     "hermes-signal": {
         "description": "Signal bot toolset - encrypted messaging platform (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        # Core Signal control-surface tool is bundled with the bot toolset; the
+        # admin tool (signal_admin) stays opt-in via its own toolset + the
+        # SIGNAL_ADMIN_TOOLS env gate.
+        "tools": _HERMES_CORE_TOOLS + ["signal"],
         "includes": []
     },
 

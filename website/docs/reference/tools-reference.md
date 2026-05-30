@@ -241,6 +241,22 @@ Registered on the `hermes-discord` platform toolset. Moderation actions require 
 |------|-------------|----------------------|
 | `discord_admin` | Manage a Discord server via the REST API: list guilds/channels/roles, create/edit/delete channels, manage role grants, timeouts, kicks, and bans. | `DISCORD_BOT_TOKEN` + bot permissions |
 
+## `signal` toolset
+
+Registered on the `hermes-signal` platform toolset. Talks to the local signal-cli JSON-RPC daemon; every method is allowlisted so account-destructive calls can never be sent.
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `signal` | Read + messaging actions: `list_contacts`, `list_groups`, `get_group_info`, `get_contact`, `get_user_status`, `list_identities`, `list_devices`, `get_avatar`, `get_sticker`, `list_sticker_packs`, `list_calls`, `send_receipt`, `send_reaction`, `create_poll`, `vote_poll`, `send_message_request_response`, `version`. | `SIGNAL_HTTP_URL` + `SIGNAL_ACCOUNT` |
+
+## `signal_admin` toolset
+
+Off by default. Enable with `SIGNAL_ADMIN_TOOLS=true` and the `signal_admin` toolset. Account-destructive signal-cli commands (register/unregister/delete-local-data/PIN/device/number-change/account-config/join-quit-group) are never exposed.
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `signal_admin` | Account-state mutations: `block_contact`, `unblock_contact`, `trust_identity`, `update_contact`, `update_group`, `remote_delete`, `pin_message`, `unpin_message`, `terminate_poll`. | `SIGNAL_HTTP_URL` + `SIGNAL_ACCOUNT` + `SIGNAL_ADMIN_TOOLS=true` |
+
 ## `spotify` toolset
 
 Registered by the bundled `spotify` plugin. Requires an OAuth token — run `hermes spotify setup` once to authorize.

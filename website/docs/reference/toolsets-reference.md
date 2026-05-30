@@ -60,6 +60,8 @@ Or in-session:
 | `delegation` | `delegate_task` | Spawn isolated subagent instances for parallel work. |
 | `discord` | `discord` | Core Discord text/embed/DM actions (gateway-only). Active on the `hermes-discord` toolset. |
 | `discord_admin` | `discord_admin` | Discord moderation (bans, role changes, channel management). Active on the `hermes-discord` toolset; requires the bot to hold the relevant Discord permissions. |
+| `signal` | `signal` | Signal read + messaging actions (contacts, groups, identities, devices, avatars, stickers, receipts, reactions, polls). Active on the `hermes-signal` toolset; requires `SIGNAL_HTTP_URL` + `SIGNAL_ACCOUNT`. |
+| `signal_admin` | `signal_admin` | Signal account-state mutations (block/unblock, trust, group/contact edits, remote-delete, pin/unpin, poll terminate). Off unless `SIGNAL_ADMIN_TOOLS=true`. Account-destructive commands are never exposed. |
 | `feishu_doc` | `feishu_doc_read` | Read Feishu/Lark document content. Used by the Feishu document-comment intelligent-reply handler. |
 | `feishu_drive` | `feishu_drive_add_comment`, `feishu_drive_list_comments`, `feishu_drive_list_comment_replies`, `feishu_drive_reply_comment` | Feishu/Lark drive comment operations. Scoped to the comment agent; not exposed on `hermes-cli` or other messaging toolsets. |
 | `file` | `patch`, `read_file`, `search_files`, `write_file` | File reading, writing, searching, and editing. |
@@ -99,7 +101,7 @@ Platform toolsets define the complete tool configuration for a deployment target
 | `hermes-discord` | Adds `discord` and `discord_admin` on top of `hermes-cli`. |
 | `hermes-slack` | Same as `hermes-cli`. |
 | `hermes-whatsapp` | Same as `hermes-cli`. |
-| `hermes-signal` | Same as `hermes-cli`. |
+| `hermes-signal` | Adds `signal` on top of `hermes-cli`. `signal_admin` is opt-in (`SIGNAL_ADMIN_TOOLS=true` + the `signal_admin` toolset). |
 | `hermes-matrix` | Same as `hermes-cli`. |
 | `hermes-mattermost` | Same as `hermes-cli`. |
 | `hermes-email` | Same as `hermes-cli`. |

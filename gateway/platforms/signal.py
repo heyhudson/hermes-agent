@@ -50,6 +50,7 @@ from gateway.platforms.signal_rate_limit import (
     _signal_send_timeout,
     get_scheduler,
 )
+from gateway.platforms.signal_rpc import assert_method_sendable
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,12 @@ class SignalAdapter(BasePlatformAdapter):
         # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds)
         self._recent_sent_timestamps: set = set()
         self._max_recent_timestamps = 50
+        # Reply-quote target per chat: the message currently being replied to.
+        # Captured in on_processing_start and consumed once by the first send()
+        # of the reply, then cleared in on_processing_complete. Lets Hermes post
+        # a native reply that quotes the triggering message. Gated by
+        # SIGNAL_REPLY_QUOTE (default on).
+        self._active_quote: Dict[str, Dict[str, Any]] = {}
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
         # phone number to the corresponding UUID when signal-cli prefers it.
@@ -752,6 +759,12 @@ class SignalAdapter(BasePlatformAdapter):
         instead of being swallowed — lets callers (multi-attachment send)
         opt into backoff-retry without changing default behaviour.
         """
+        # Hard safety valve (defense in depth): account-destructive and
+        # unrecognized methods can never be sent to the daemon, even through a
+        # bug or injection in a caller. The allowlist lives in signal_rpc.py.
+        # Raises SignalMethodNotAllowed (a ValueError) — fail closed and loud.
+        assert_method_sendable(method)
+
         if not self.client:
             logger.warning("Signal: RPC called but client not connected")
             return None
@@ -814,9 +827,9 @@ class SignalAdapter(BasePlatformAdapter):
         Positions are measured in **UTF-16 code units** (not Python code
         points) because that's what the Signal protocol uses.
 
-        Supported styles: BOLD, ITALIC, STRIKETHROUGH, MONOSPACE.
-        (Signal's SPOILER style is not currently mapped — no standard
-        markdown syntax for it; would need ``||spoiler||`` parsing.)
+        Supported styles: BOLD, ITALIC, STRIKETHROUGH, MONOSPACE, SPOILER.
+        SPOILER maps the ``||spoiler||`` syntax (as used by Discord/Signal)
+        to Signal's SPOILER textStyle.
 
         Returns ``(plain_text, styles_list)`` where *styles_list* may be
         empty if there's nothing to format.
@@ -872,13 +885,26 @@ class SignalAdapter(BasePlatformAdapter):
             (re.compile(r"__(.+?)__", re.DOTALL), "BOLD"),
             (re.compile(r"~~(.+?)~~", re.DOTALL), "STRIKETHROUGH"),
             (re.compile(r"`(.+?)`"), "MONOSPACE"),
+            # SPOILER (||text||). Placed after MONOSPACE so "||" inside inline
+            # code is protected, and before ITALIC. The \S lookaround anchors
+            # require non-space content immediately inside the bars so logical
+            # OR (``a || b || c``) and bare ``||`` don't false-positive. No
+            # DOTALL → a spoiler stays on a single line.
+            (re.compile(r"\|\|(?=\S)(.+?)(?<=\S)\|\|"), "SPOILER"),
             (re.compile(r"(?<!\*)\*(?!\*| )(.+?)(?<!\*)\*(?!\*)"), "ITALIC"),
             (re.compile(r"(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)"), "ITALIC"),
         ]
 
         # Collect all non-overlapping matches (earlier patterns win ties).
         all_matches: list = []  # (start, end, g1_start, g1_end, style)
-        occupied: list = []     # (start, end) intervals already claimed
+        # Seed claimed intervals with the fenced-code spans recorded in Phase 1
+        # (the only MONOSPACE entries at this point). This keeps inline patterns
+        # from styling markers *inside* a fenced code block — code stays
+        # verbatim, so e.g. ``**`` / ``||`` / backticks within a block are
+        # preserved rather than converted or stripped.
+        occupied: list = [
+            (s, s + length) for s, length, st in styles if st == "MONOSPACE"
+        ]
         for pat, style in _PATTERNS:
             for m in pat.finditer(text):
                 ms, me = m.start(), m.end()
@@ -936,6 +962,10 @@ class SignalAdapter(BasePlatformAdapter):
         for cp_start, cp_len, stype in sorted(styles):
             # Safety: skip any out-of-bounds styles
             if cp_start < 0 or cp_start + cp_len > len(text):
+                logger.debug(
+                    "Signal: skipping out-of-bounds %s style (start=%d len=%d, text len=%d)",
+                    stype, cp_start, cp_len, len(text),
+                )
                 continue
             u16_start = _utf16_len(text[:cp_start])
             u16_len = _utf16_len(text[cp_start : cp_start + cp_len])
@@ -984,7 +1014,35 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
+        # Native reply quote. Explicit metadata wins; otherwise auto-quote the
+        # message that triggered this turn (captured in on_processing_start).
+        self._apply_quote_params(params, metadata)
+        if "quoteTimestamp" not in params:
+            self._apply_auto_quote(params, chat_id)
+
         result = await self._rpc("send", params)
+
+        # Progressive fallback: some signal-cli builds reject optional
+        # decorations — a reply quote, or text styles / malformed ranges.
+        # Rather than silently losing the message, drop the decorations and
+        # retry: first the reply quote, then the text styles, so the message
+        # still gets delivered (in plainer form) instead of failing outright.
+        if result is None:
+            retry = dict(params)
+            _QUOTE_KEYS = (
+                "quoteTimestamp", "quoteAuthor", "quoteMessage",
+                "quoteTextStyle", "quoteMention",
+            )
+            if any(k in retry for k in _QUOTE_KEYS):
+                for k in _QUOTE_KEYS:
+                    retry.pop(k, None)
+                logger.info("Signal: send failed; retrying without the reply quote")
+                result = await self._rpc("send", retry)
+            if result is None and ("textStyle" in retry or "textStyles" in retry):
+                retry.pop("textStyle", None)
+                retry.pop("textStyles", None)
+                logger.info("Signal: send failed; retrying without text styles")
+                result = await self._rpc("send", retry)
 
         if result is not None:
             self._track_sent_timestamp(result)
@@ -993,6 +1051,94 @@ class SignalAdapter(BasePlatformAdapter):
             # future edits can remove an in-progress cursor from the chat thread.
             return SendResult(success=True, message_id=None)
         return SendResult(success=False, error="RPC send failed")
+
+    @staticmethod
+    def _apply_quote_params(
+        params: Dict[str, Any], metadata: Optional[Dict[str, Any]]
+    ) -> None:
+        """Attach Signal reply-quote params from *metadata*, in place.
+
+        A Signal quote needs the quoted message's timestamp (ms) and author;
+        the quoted text is optional but improves how the reply renders. We only
+        attach quote params when both timestamp and author are explicitly
+        supplied via metadata (keys ``quote_timestamp``/``quote_author`` or the
+        ``signal_``-prefixed variants) so ordinary sends are byte-for-byte
+        unchanged and we never fabricate a recipient.
+        """
+        if not metadata:
+            return
+        qts = metadata.get("quote_timestamp")
+        if qts is None:
+            qts = metadata.get("signal_quote_timestamp")
+        qauthor = metadata.get("quote_author") or metadata.get("signal_quote_author")
+        if qts is None or not qauthor:
+            return
+        # Only attach a quote for a well-formed author (E.164 number or Signal
+        # service id) so malformed/empty metadata can never corrupt a normal
+        # send or fabricate a quote against an arbitrary string.
+        if not (_looks_like_e164_number(qauthor) or _is_signal_service_id(qauthor)):
+            logger.debug("Signal: ignoring reply quote with malformed author")
+            return
+        try:
+            params["quoteTimestamp"] = int(qts)
+        except (TypeError, ValueError):
+            return
+        params["quoteAuthor"] = qauthor
+        qmsg = metadata.get("quote_message") or metadata.get("signal_quote_message")
+        if qmsg:
+            params["quoteMessage"] = qmsg
+
+    @staticmethod
+    def _scope_enabled(env_name: str, chat_id: str, *, default: str = "false") -> bool:
+        """Return whether a Signal feature is enabled for this chat scope.
+
+        Accepted values:
+        - true/1/yes/on/all: DMs + groups
+        - group/groups: groups only
+        - dm/dms/direct/directs: DMs only
+        - false/0/no/off/empty: disabled
+        """
+        raw = os.getenv(env_name, default).strip().lower()
+        is_group = chat_id.startswith("group:")
+        if raw in {"true", "1", "yes", "on", "all"}:
+            return True
+        if raw in {"group", "groups"}:
+            return is_group
+        if raw in {"dm", "dms", "direct", "directs"}:
+            return not is_group
+        return False
+
+    @classmethod
+    def _reply_quote_enabled(cls, chat_id: str) -> bool:
+        """Whether replies should natively quote the triggering message.
+
+        Off by default until validated against the deployed signal-cli version
+        (quote params vary across builds). Set SIGNAL_REPLY_QUOTE=true for all
+        chats, or SIGNAL_REPLY_QUOTE=groups to limit native quotes to groups.
+        """
+        return cls._scope_enabled("SIGNAL_REPLY_QUOTE", chat_id)
+
+    def _apply_auto_quote(self, params: Dict[str, Any], chat_id: str) -> None:
+        """Attach a reply quote for the message that triggered this turn.
+
+        Consumes the per-chat quote target captured in on_processing_start so
+        only the first outbound message of a reply quotes, and only for genuine
+        replies (proactive / cron / home-channel sends have no active target).
+        """
+        if not self._reply_quote_enabled(chat_id):
+            return
+        target = self._active_quote.get(chat_id)
+        if not target or target.get("used"):
+            return
+        author = target.get("author")
+        ts = target.get("timestamp")
+        if not author or not ts:
+            return
+        if not (_looks_like_e164_number(author) or _is_signal_service_id(author)):
+            return
+        params["quoteTimestamp"] = int(ts)
+        params["quoteAuthor"] = author
+        target["used"] = True
 
     def _track_sent_timestamp(self, rpc_result) -> None:
         """Record outbound message timestamp for echo-back filtering."""
@@ -1484,11 +1630,44 @@ class SignalAdapter(BasePlatformAdapter):
                 return False
         return True
 
+    def _read_receipts_enabled(self, chat_id: str) -> bool:
+        """Whether inbound messages should get Signal read receipts.
+
+        Set SIGNAL_READ_RECEIPTS=true for all chats, or
+        SIGNAL_READ_RECEIPTS=groups to acknowledge only group messages.
+        """
+        return self._scope_enabled("SIGNAL_READ_RECEIPTS", chat_id)
+
+    async def _send_read_receipt(self, chat_id: str, author: str, timestamp_ms: int) -> None:
+        """Best-effort read receipt for the triggering Signal message."""
+        if not self._read_receipts_enabled(chat_id):
+            return
+        if not author or not timestamp_ms:
+            return
+        params = {
+            "account": self.account,
+            "recipient": author,
+            "targetTimestamp": [int(timestamp_ms)],
+            "type": "read",
+        }
+        try:
+            await self._rpc("sendReceipt", params)
+        except Exception as exc:  # noqa: BLE001 — receipts are best-effort
+            logger.debug("Signal: read receipt failed: %s", exc)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """React with 👀 when processing begins."""
+        """React with 👀 when processing begins, mark read, and record quote target."""
+        target = self._extract_reaction_target(event)
+        # Record the triggering message as this chat's reply-quote target before
+        # the reactions gate, so native reply quotes work even when reactions
+        # are disabled.
+        if target:
+            self._active_quote[event.source.chat_id] = {
+                "author": target[0], "timestamp": target[1], "used": False,
+            }
+            await self._send_read_receipt(event.source.chat_id, target[0], target[1])
         if not self._reactions_enabled(event):
             return
-        target = self._extract_reaction_target(event)
         if target:
             await self.send_reaction(event.source.chat_id, "👀", *target)
 
@@ -1498,6 +1677,9 @@ class SignalAdapter(BasePlatformAdapter):
         On CANCELLED we leave the 👀 in place — no terminal outcome means
         the reaction should keep reflecting "in progress" (matches Telegram).
         """
+        # The reply-quote target is per-turn; release it once the turn ends
+        # (regardless of outcome or whether reactions are enabled).
+        self._active_quote.pop(event.source.chat_id, None)
         if not self._reactions_enabled(event):
             return
         if outcome == ProcessingOutcome.CANCELLED:

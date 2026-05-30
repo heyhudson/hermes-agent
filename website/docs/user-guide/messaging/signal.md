@@ -173,13 +173,26 @@ Attachment size limit: **100 MB** (both directions).
 
 ### Native Formatting, Reply Quotes, and Reactions
 
-Signal messages render with **native formatting** instead of literal markdown characters. The adapter converts markdown (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `||spoiler||`, headings) into Signal `bodyRanges` so the text shows up with real styling on the recipient's client rather than as visible `**` / `` ` `` characters.
+Signal messages render with **native formatting** instead of literal markdown characters. The adapter converts markdown into Signal `bodyRanges` (`textStyles`) so the text shows up with real styling on the recipient's client rather than as visible `**` / `` ` `` markers:
 
-**Reply quotes.** When Hermes replies to a specific message, it now posts a native reply that quotes the original — same UI affordance Signal users see when they use "Reply" themselves. This is automatic for replies generated in response to an inbound message.
+| Markdown | Signal style |
+|----------|--------------|
+| `**bold**` or `__bold__` | BOLD |
+| `*italic*` or `_italic_` | ITALIC |
+| `~~strike~~` | STRIKETHROUGH |
+| `` `code` `` and ```` ```fenced``` ```` | MONOSPACE |
+| `# Heading` … `###### Heading` | BOLD |
+| `\|\|spoiler\|\|` | SPOILER |
 
-**Reactions.** The agent can react to messages via the standard reaction API; reactions surface in Signal as emoji reactions on the referenced message rather than as extra text.
+Offsets are computed in **UTF-16 code units** (the unit the Signal protocol uses), so emoji (including astral-plane / surrogate-pair codepoints), CJK text, combining marks, and ZWJ sequences are positioned correctly. The spoiler parser requires non-space content immediately inside the bars (`||hidden||`), so logical-OR in code (`a || b || c`) is **not** mistaken for a spoiler, and `||` inside inline code is left untouched.
 
-None of this requires additional config — it ships on by default in recent signal-cli builds. If your `signal-cli` version is too old, Hermes falls back to plaintext delivery and logs a one-time warning.
+**Graceful fallback.** If signal-cli rejects the style params (e.g. an older build), the send is automatically retried once as plain text so the message is still delivered rather than lost. A one-line INFO is logged when this happens.
+
+**Reply quotes.** Replies natively quote the message that triggered them — the same affordance Signal users see when they tap "Reply". The adapter captures the triggering message when a turn starts and attaches it to the first message of the reply (works in DMs and groups). Proactive/cron/home-channel sends never quote. Set `SIGNAL_REPLY_QUOTE=false` to turn this off. Callers can also pass an explicit `quote_timestamp` + `quote_author` (+ optional `quote_message`) in the send `metadata`, which takes precedence; Hermes never fabricates a quote author.
+
+**Reactions.** The agent reacts to messages via the standard reaction API (also exposed as `signal` → `send_reaction`); reactions surface in Signal as emoji reactions on the referenced message rather than as extra text.
+
+Formatting and reactions require no additional config — they ship on by default in recent signal-cli builds.
 
 ### Typing Indicators
 
@@ -212,6 +225,68 @@ The adapter monitors the SSE connection and automatically reconnects if:
 
 ---
 
+## Signal Control-Surface Tools
+
+Beyond sending and receiving, the agent can drive a curated slice of signal-cli through two action-dispatch tools. Both talk to the local signal-cli daemon over HTTP JSON-RPC and require `SIGNAL_HTTP_URL` + `SIGNAL_ACCOUNT`. Every method is routed through an **allowlist** — account-destructive and unrecognized methods can never reach the daemon (see [Safety Tiers](#safety-tiers)).
+
+### `signal` tool (read + messaging)
+
+Bundled with the `hermes-signal` toolset (no extra config). Call with an `action` plus action-specific params (use `recipient_id` for DMs, `group_id` for groups; message ids are millisecond timestamps):
+
+| Action | Purpose |
+|--------|---------|
+| `version` | signal-cli version |
+| `list_contacts` / `list_groups` | enumerate contacts / groups |
+| `get_group_info` | details for one `group_id` |
+| `get_contact` | profile name for a `recipient_id` |
+| `get_user_status` | check whether a number is registered on Signal |
+| `list_identities` | identities / safety numbers |
+| `list_devices` | linked devices |
+| `get_avatar` / `get_sticker` | fetch media (cached under the Hermes home) |
+| `list_sticker_packs` | installed sticker packs |
+| `list_calls` | call history |
+| `send_receipt` | send a read / viewed receipt |
+| `send_reaction` | react to a message (`emoji`, `target_author`, `target_timestamp`) |
+| `create_poll` / `vote_poll` | create or vote in a poll |
+| `send_message_request_response` | accept / delete an incoming message request |
+
+### `signal_admin` tool (account-state mutations)
+
+**Disabled by default.** Enable with `SIGNAL_ADMIN_TOOLS=true` *and* the `signal_admin` toolset. Even if the schema is reached, the handler refuses unless the flag is set.
+
+**Interactive confirmation.** On top of the env gate, every admin action prompts for confirmation before it runs (the shared Hermes approval prompt — `[o]nce / [s]ession / [d]eny`). If approval can't be obtained (e.g. a headless session with no approval UI) the action is denied (fail-closed). `--yolo` sessions auto-approve. Set `SIGNAL_ADMIN_REQUIRE_CONFIRM=false` to run admin actions unattended.
+
+| Action | Purpose |
+|--------|---------|
+| `block_contact` / `unblock_contact` | block / unblock a contact or group |
+| `trust_identity` | trust an identity / safety number |
+| `update_contact` | edit a contact's local name / note |
+| `update_group` | edit group name / description / members |
+| `remote_delete` | remote-delete a message the bot previously sent |
+| `pin_message` / `unpin_message` | pin / unpin a message |
+| `terminate_poll` | terminate a poll |
+
+Errors are returned as JSON with phone numbers redacted. You can further restrict the exposed actions with a `signal.actions` config list (comma-separated or YAML list), mirroring `discord.server_actions`.
+
+### Safety Tiers
+
+| Tier | Examples | Exposure |
+|------|----------|----------|
+| **1 — read-only** | list/get contacts, groups, identities, devices, avatars, stickers, user status | `signal` tool |
+| **2 — messaging side-effect** | receipts, reactions, polls, message-request response | `signal` tool (destination is explicit; DM/group allowlists still apply) |
+| **3 — account-state mutation** | block/unblock, trust, group/contact edits, remote-delete, pin/unpin | `signal_admin` only, `SIGNAL_ADMIN_TOOLS=true` |
+| **4 — account-destructive** | register, unregister, delete local data, PIN, device, number-change, account config, join/quit group | **Never exposed; blocked at the RPC allowlist before any network call** |
+
+### Intentionally Unsupported (account-destructive)
+
+The following signal-cli commands are deliberately **not** exposed by any tool and are blocked from being sent to the daemon, because they can destroy or hijack the account. Run them yourself with the `signal-cli` CLI if you ever need them:
+
+`register`, `verify`, `unregister`, `deleteLocalAccountData`, `setPin`, `removePin`, `addDevice`, `removeDevice`, `link`, `startChangeNumber`, `finishChangeNumber`, `updateAccount`, `updateConfiguration`, `updateDevice`, `joinGroup`, `quitGroup`.
+
+Arbitrary / free-form RPC method execution is never available to the agent — only the curated actions above.
+
+---
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -223,6 +298,8 @@ The adapter monitors the SSE connection and automatically reconnects if:
 | **Group messages ignored** | Configure `SIGNAL_GROUP_ALLOWED_USERS` with specific group IDs, or `*` to allow all groups. |
 | **Bot responds to no one** | Configure `SIGNAL_ALLOWED_USERS`, use DM pairing, or explicitly allow all users through gateway policy if you want broader access. |
 | **Duplicate messages** | Ensure only one signal-cli instance is listening on your phone number |
+| **`signal_admin` actions rejected** | Set `SIGNAL_ADMIN_TOOLS=true` and enable the `signal_admin` toolset. Account-destructive commands remain blocked by design. |
+| **Signal tools "not configured"** | The `signal`/`signal_admin` tools need `SIGNAL_HTTP_URL` + `SIGNAL_ACCOUNT` in the agent's environment, same as the gateway. |
 
 ---
 
@@ -250,3 +327,6 @@ The adapter monitors the SSE connection and automatically reconnects if:
 | `SIGNAL_GROUP_ALLOWED_USERS` | No | — | Group IDs to monitor, or `*` for all (omit to disable groups) |
 | `SIGNAL_ALLOW_ALL_USERS` | No | `false` | Allow any user to interact (skip allowlist) |
 | `SIGNAL_HOME_CHANNEL` | No | — | Default delivery target for cron jobs |
+| `SIGNAL_ADMIN_TOOLS` | No | `false` | Enable the `signal_admin` tool (block/trust/group edits/remote-delete/pin). Account-destructive commands stay blocked regardless. |
+| `SIGNAL_ADMIN_REQUIRE_CONFIRM` | No | `true` | Require interactive confirmation before each `signal_admin` action. Set `false` for unattended admin use. |
+| `SIGNAL_REPLY_QUOTE` | No | `true` | Natively quote the triggering message in replies. Set `false` to disable. |
